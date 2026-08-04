@@ -1,18 +1,22 @@
-# mcp-gnomad
+# @pipeworx/gnomad
 
-gnomAD MCP — Broad Institute Genome Aggregation Database (GraphQL).
+[gnomAD](https://gnomad.broadinstitute.org) MCP — Genome Aggregation Database (Broad Institute) public GraphQL endpoint. Population allele frequencies + variant pathogenicity annotations. Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 673+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1394+ live data sources.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `variant` | Variant by chr-pos-ref-alt (e.g. "1-55051215-G-A") or rsid. |
-| `gene` | Gene info + variants. Accepts gene symbol (e.g. "BRCA1") or Ensembl gene id. |
-| `region` | Variants in a genomic region (≤25kb recommended). |
-| `transcript` | Transcript + variants. |
-| `search` | Gene / variant search (autocomplete). |
+- `variant(variant_id, dataset?)` — by `chr-pos-ref-alt` (e.g. `1-55051215-G-A`) or rsid
+- `gene(gene_symbol_or_id, dataset?)` — variants in / near a gene
+- `region(chrom, start, stop, dataset?)` — variants in a genomic region
+- `transcript(transcript_id, dataset?)` — variants in / near a transcript
+- `search(query)` — gene / variant search (autocomplete)
+
+`dataset` defaults to `gnomad_r4` (most recent release). Other valid: `gnomad_r3`, `gnomad_r2_1`, `gnomad_sv_r4`, etc.
+
+## Data source
+
+`https://gnomad.broadinstitute.org/api`
 
 ## Quick Start
 
@@ -28,7 +32,7 @@ Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
 }
 ```
 
-Or connect to the full Pipeworx gateway for access to all 673+ data sources:
+Or connect to the full Pipeworx gateway for access to all 1394+ data sources:
 
 ```json
 {
@@ -52,7 +56,7 @@ The gateway picks the right tool and fills the arguments automatically.
 
 ## More
 
-- [All tools and guides](https://github.com/pipeworx-io/examples)
+- [Docs and guides](https://pipeworx.io/docs)
 - [pipeworx.io](https://pipeworx.io)
 
 ## License
