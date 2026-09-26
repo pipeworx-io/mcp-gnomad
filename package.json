@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-gnomad",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "gnomAD MCP — Broad Institute Genome Aggregation Database (GraphQL).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-907f7391fb0f93b6ece56d4cabb558823ce3c830e8137116037317f9b0dfe366",
-    "sourceCommit": "76aa8f5d9b5dc2f665563030647c68e661478864"
+    "sourceHash": "v1-da56f081530985974a7f15e91f97b37f81a0ab74b5171ccaa147bd36f5e14607",
+    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
   }
 }
