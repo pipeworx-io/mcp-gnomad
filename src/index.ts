@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,6 +686,600 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+
+
+/**
+ * Read a JSON body off the stream keeping only a WINDOW of chosen nested
+ * arrays (fleet #3293).
+ *
+ * ── WHY ──
+ * `readJsonArrayPrefix` (http.ts, #3322) bounds the one shape where the big
+ * array IS the body. The named remaining 1102 term after #3322 is the other
+ * shape: a small envelope around one enormous NESTED array that the upstream
+ * offers no way to limit. gnomAD's GraphQL is the worked case:
+ *
+ *   {"data":{"gene":{"gene_id":…, "variants":[ …7,287 objects… ]}}}
+ *
+ * `variants` takes no `first`/`limit` argument, so `res.json()` materialises
+ * 2,732,190 B (BRCA1, measured live 2026-10-22 on 537c5730d) as a string AND
+ * as an object graph several times that size — inside the pack, before any
+ * gateway payload cap can see it. Five of those on one isolate is the 128 MB
+ * ceiling (docs/gateway-1102-runner-vs-external-2026-10-20.md).
+ *
+ * ── HOW ──
+ * A character-level filter runs over the decoded stream and copies the body
+ * through to an output buffer, EXCEPT for the elements of a windowed array
+ * that fall outside `[offset, offset + limit)`. Those are scanned (strings,
+ * escapes and brackets tracked so a `]` inside a string cannot end the array)
+ * and dropped on the floor. Consumed input is released chunk by chunk, so the
+ * peak retained memory is the kept text plus one chunk — not the body.
+ * `JSON.parse` runs once, at the end, on the reduced text.
+ *
+ * Every windowed array reports `{ path, total, kept, offset, limit }`, and
+ * `total` is EXACT because every element is still counted. That is what lets
+ * a pack say "500 of 7,287 shown, next offset 500" rather than handing back a
+ * short list that reads as complete — the silent-partial class
+ * (docs/silent-zero-policy.md).
+ *
+ * ── PATHS ──
+ * Object keys joined with `.`; an array element contributes `[]`. So
+ * `data.gene.variants` is the array, `data.gene.variants[].rsids` is an array
+ * inside each variant. The `window` callback is asked once per array opened.
+ *
+ * ── FAILS LOUD, never silently ──
+ *   - `maxBytes` (default 32 MB): bytes pulled off the socket. Over it, the
+ *     read stops and THROWS — a body that size is a query to narrow.
+ *   - `maxOutputChars` (default 1.5 MB): text KEPT. If the upstream renames
+ *     the array a window targets, nothing matches and the whole body would be
+ *     kept; this turns that into an error naming the cause instead of quietly
+ *     reinstating the allocation this module exists to prevent.
+ */
+
+interface ArrayWindow {
+  offset: number;
+  limit: number;
+}
+
+interface ArrayWindowReport extends ArrayWindow {
+  /** Dotted path of the array, e.g. `data.gene.variants`. */
+  path: string;
+  /** Elements the upstream array actually held — exact, every one was counted. */
+  total: number;
+  /** Elements kept in the parsed value. */
+  kept: number;
+}
+
+interface WindowedJson<T> {
+  value: T;
+  /** One entry per windowed array that was opened, in document order. */
+  arrays: ArrayWindowReport[];
+  /** Bytes pulled off the socket. */
+  bytesRead: number;
+  /** Characters of JSON text kept and parsed — the number that bounds memory. */
+  keptChars: number;
+}
+
+interface WindowOptions {
+  window: (path: string) => ArrayWindow | undefined;
+  maxBytes?: number;
+  maxOutputChars?: number;
+}
+
+const WINDOW_DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
+const WINDOW_DEFAULT_MAX_OUTPUT_CHARS = 1_500_000;
+
+interface Frame {
+  arr: boolean;
+  path: string;
+  /** obj: the key whose value comes next. */
+  key: string;
+  /** obj: next string token is a key. */
+  expectKey: boolean;
+  /** arr: elements started so far (kept or not). */
+  index: number;
+  /** arr: elements kept so far — decides whether to write a comma. */
+  kept: number;
+  /** arr: inside an element (a multi-character scalar is ONE element). */
+  open: boolean;
+  window?: ArrayWindow;
+}
+
+/**
+ * The streaming filter, exposed for tests and for callers that already hold
+ * text chunks. `feed()` any number of times, then `end()` for the kept text.
+ */
+class JsonWindowFilter {
+  private out: string[] = [];
+  private outChars = 0;
+  private stack: Frame[] = [];
+  private reports: ArrayWindowReport[] = [];
+  private inStr = false;
+  private esc = false;
+  /** Capturing an object key's raw characters. */
+  private keyRaw: string | null = null;
+  /** >= 0 while dropping an out-of-window element: bracket depth inside it. */
+  private skipDepth = -1;
+  private skipInStr = false;
+  private skipEsc = false;
+
+  // Plain fields + assignments, NOT parameter properties (`private readonly x`
+  // in the signature). A parameter property needs real TypeScript
+  // TRANSFORMATION; node's strip-only mode (the default on node 22.18+/24+/25,
+  // and the only mode `scripts/lib/pack-smoke.mjs` loads packs under) rejects
+  // it with ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX. This file is re-exported from
+  // the `@pipeworx/shared` barrel, so one parameter property here stopped
+  // EVERY pack from loading under the smoke harness (fleet #3474).
+  // tests/strip-only-loadable.test.ts keeps it that way.
+  private readonly windowFor: (path: string) => ArrayWindow | undefined;
+  private readonly maxOutputChars: number;
+  private readonly name: string;
+
+  constructor(
+    windowFor: (path: string) => ArrayWindow | undefined,
+    maxOutputChars: number = WINDOW_DEFAULT_MAX_OUTPUT_CHARS,
+    name: string = 'upstream',
+  ) {
+    this.windowFor = windowFor;
+    this.maxOutputChars = maxOutputChars;
+    this.name = name;
+  }
+
+  get arrays(): ArrayWindowReport[] { return this.reports; }
+  get keptChars(): number { return this.outChars; }
+
+  private emit(s: string): void {
+    if (!s) return;
+    this.out.push(s);
+    this.outChars += s.length;
+    if (this.outChars > this.maxOutputChars) {
+      throw new Error(
+        `upstream_down: ${this.name} returned more than ${this.maxOutputChars.toLocaleString()} characters outside the ` +
+          'arrays this tool pages through, so it stopped reading rather than hold the whole body in memory. The ' +
+          'upstream response shape has probably changed (a renamed field leaves nothing to page). Narrow the request and retry.',
+      );
+    }
+  }
+
+  private childPath(): string {
+    const top = this.stack[this.stack.length - 1];
+    if (!top) return '';
+    if (top.arr) return `${top.path}[]`;
+    return top.path ? `${top.path}.${top.key}` : top.key;
+  }
+
+  feed(chunk: string): void {
+    let from = 0; // start of the pending run to copy through
+    const n = chunk.length;
+    let i = 0;
+    while (i < n) {
+      const ch = chunk[i];
+
+      // ── Dropping an out-of-window element ──
+      if (this.skipDepth >= 0) {
+        if (this.skipInStr) {
+          if (this.skipEsc) this.skipEsc = false;
+          else if (ch === '\\') this.skipEsc = true;
+          else if (ch === '"') this.skipInStr = false;
+          i++;
+          continue;
+        }
+        if (ch === '"') { this.skipInStr = true; i++; continue; }
+        if (ch === '{' || ch === '[') { this.skipDepth++; i++; continue; }
+        if ((ch === '}' || ch === ']') && this.skipDepth > 0) { this.skipDepth--; i++; continue; }
+        if (this.skipDepth === 0 && (ch === ',' || ch === ']')) {
+          // The element is over. Hand this character back to the normal path.
+          this.skipDepth = -1;
+          from = i;
+          continue;
+        }
+        i++;
+        continue;
+      }
+
+      // ── Inside a string ──
+      if (this.inStr) {
+        if (this.esc) this.esc = false;
+        else if (ch === '\\') this.esc = true;
+        else if (ch === '"') {
+          this.inStr = false;
+          if (this.keyRaw !== null) {
+            this.keyRaw += chunk.slice(from, i);
+            const top = this.stack[this.stack.length - 1];
+            try { top.key = JSON.parse(`"${this.keyRaw}"`) as string; } catch { top.key = this.keyRaw; }
+            this.keyRaw = null;
+            this.emit(chunk.slice(from, i + 1));
+            from = i + 1;
+          }
+        }
+        i++;
+        continue;
+      }
+
+      if (ch === ' ' || ch === '\n' || ch === '\r' || ch === '\t') { i++; continue; }
+
+      const top = this.stack[this.stack.length - 1];
+
+      // A value starting directly inside an array is a new element.
+      if (top?.arr && !top.open && ch !== ']' && ch !== ',') {
+        const idx = top.index++;
+        top.open = true;
+        const w = top.window;
+        if (w && (idx < w.offset || idx >= w.offset + w.limit)) {
+          this.emit(chunk.slice(from, i));
+          this.skipDepth = 0;
+          this.skipInStr = false;
+          this.skipEsc = false;
+          continue; // re-read this char in skip mode
+        }
+        if (top.kept > 0) { this.emit(chunk.slice(from, i)); this.emit(','); from = i; }
+        top.kept++;
+      }
+
+      if (ch === ',' && top?.arr) {
+        // Commas between array elements are written at the next KEPT element,
+        // so dropped elements never leave a `,,` behind.
+        this.emit(chunk.slice(from, i));
+        top.open = false;
+        from = i + 1;
+        i++;
+        continue;
+      }
+
+      switch (ch) {
+        case '"':
+          this.inStr = true;
+          if (top && !top.arr && top.expectKey) {
+            this.emit(chunk.slice(from, i + 1));
+            from = i + 1;
+            this.keyRaw = '';
+          }
+          break;
+        case ':':
+          if (top && !top.arr) top.expectKey = false;
+          break;
+        case ',':
+          if (top && !top.arr) top.expectKey = true;
+          break;
+        case '{':
+        case '[': {
+          const path = this.childPath();
+          const arr = ch === '[';
+          const frame: Frame = { arr, path, key: '', expectKey: !arr, index: 0, kept: 0, open: false };
+          if (arr) {
+            const w = this.windowFor(path);
+            if (w) frame.window = { offset: Math.max(0, Math.trunc(w.offset)), limit: Math.max(0, Math.trunc(w.limit)) };
+          }
+          this.stack.push(frame);
+          break;
+        }
+        case '}':
+        case ']': {
+          const done = this.stack.pop();
+          if (done?.arr && done.window) {
+            this.reports.push({ path: done.path, total: done.index, kept: done.kept, ...done.window });
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      i++;
+    }
+    if (this.skipDepth < 0) {
+      const tail = chunk.slice(from, n);
+      // A key split across chunks: its raw part is carried for the parse on
+      // close, AND written through now like any other kept text.
+      if (this.keyRaw !== null) this.keyRaw += tail;
+      this.emit(tail);
+    }
+  }
+
+  /** The kept JSON text. */
+  end(): string {
+    return this.out.join('');
+  }
+}
+
+/**
+ * Read `res` keeping only the windows `opts.window` asks for, and parse it.
+ *
+ *     const { value, arrays } = await readJsonWindowed<Gql>(res, 'gnomAD', {
+ *       window: (p) => (p.endsWith('.variants') ? { offset, limit } : undefined),
+ *     });
+ */
+async function readJsonWindowed<T>(res: Response, name: string, opts: WindowOptions): Promise<WindowedJson<T>> {
+  const maxBytes = opts.maxBytes ?? WINDOW_DEFAULT_MAX_BYTES;
+  const filter = new JsonWindowFilter(opts.window, opts.maxOutputChars ?? WINDOW_DEFAULT_MAX_OUTPUT_CHARS, name);
+  let bytesRead = 0;
+
+  if (!res.body) {
+    // No stream (a mock, a buffered response): same filter, one chunk. Correct
+    // output, just without the memory bound.
+    const raw = await res.text();
+    bytesRead = raw.length;
+    filter.feed(raw);
+  } else {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytesRead += value.byteLength;
+        if (bytesRead > maxBytes) {
+          throw new Error(
+            `upstream_down: ${name} answered with more than ${maxBytes.toLocaleString()} bytes, so this tool stopped reading ` +
+              'it. A body that size is a query to narrow (a smaller region, a specific id, or a lower limit), not one to page through.',
+          );
+        }
+        filter.feed(decoder.decode(value, { stream: true }));
+      }
+      filter.feed(decoder.decode());
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+  }
+
+  const text = filter.end();
+  if (!text.trim()) {
+    throw new Error(`upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected.`);
+  }
+  let value: T;
+  try {
+    value = JSON.parse(text) as T;
+  } catch {
+    throw new Error(`upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. It begins: ${text.slice(0, 120)}`);
+  }
+  return { value, arrays: filter.arrays, bytesRead, keptChars: filter.keptChars };
+}
 /**
  * gnomAD MCP — Broad Institute Genome Aggregation Database (GraphQL).
  *
@@ -732,6 +1342,85 @@ function reqAssembly(args: Record<string, unknown>, dataset: string): 'GRCh37' |
   return a;
 }
 
+// ── Variant lists are PAGED here, because upstream cannot page them (fleet #3293) ──
+//
+// `gene`, `region` and `transcript` select `variants(dataset:)`, a field that
+// takes no limit or cursor: gnomAD answers with every variant it holds. For
+// BRCA1 that is 7,287 variants and 2,732,190 B; a 25 kb region was 2,624,506 B
+// and ENST00000357654 1,489,792 B (all measured live 2026-10-22, 537c5730d).
+// `res.json()` on that holds the string AND an object graph several times its
+// size inside the gateway isolate, and a handful in flight at once is the
+// 128 MB ceiling: Cloudflare kills the isolate and every request on it gets
+// 503/1102. No gateway payload cap can help, because the allocation happens
+// here, before the gateway sees a payload.
+//
+// So the body is read with readJsonWindowed: the variants array is filtered
+// on the stream to [offset, offset + limit) and everything else in the
+// document is kept as-is. Every variant is still COUNTED, so the response
+// says exactly how many exist and where the next page starts — a short list
+// never reads as the whole list.
+const VARIANTS_DEFAULT_LIMIT = 500;
+const VARIANTS_MAX_LIMIT = 2000;
+const VARIANTS_PATH = /^data\.(gene|region|transcript)\.variants$/;
+
+const PAGE_ARGS = {
+  limit: {
+    type: 'number',
+    description: `Variants to return, 1-${VARIANTS_MAX_LIMIT}. Default ${VARIANTS_DEFAULT_LIMIT}. gnomAD returns every variant with no limit of its own (BRCA1 has ~7,300), so the list is paged here; variants_page says how many exist and the next offset.`,
+  },
+  offset: { type: 'number', description: 'Skip this many variants first, for the next page (variants_page.next_offset). Default 0.' },
+} as const;
+
+interface VariantsWindow { offset: number; limit: number }
+
+function variantsWindow(args: Record<string, unknown>): VariantsWindow {
+  const rawLimit = Number(args.limit);
+  const limit = Number.isFinite(rawLimit) && rawLimit >= 1
+    ? Math.min(Math.trunc(rawLimit), VARIANTS_MAX_LIMIT)
+    : VARIANTS_DEFAULT_LIMIT;
+  const rawOffset = Number(args.offset);
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.trunc(rawOffset) : 0;
+  return { offset, limit };
+}
+
+/**
+ * What the caller is told about the page. `truncated` is true whenever the
+ * response holds fewer variants than gnomAD has — including a page that is
+ * not the first — so it can never be read as the complete list.
+ */
+function variantsPage(
+  rep: ArrayWindowReport | undefined,
+  win: VariantsWindow,
+  upstreamBytes: number,
+  narrowHint: string,
+): Record<string, unknown> {
+  // No variants array at all: the gene/region/transcript itself was not found,
+  // and gnomAD's own null already says so. Nothing was paged.
+  if (!rep) return {};
+  const end = rep.offset + rep.kept;
+  const truncated = rep.kept < rep.total;
+  const next = end < rep.total ? end : null;
+  const note = !truncated
+    ? `All ${rep.total.toLocaleString()} variants are in this response.`
+    : rep.kept === 0
+      ? `offset ${rep.offset.toLocaleString()} is past the end: gnomAD has ${rep.total.toLocaleString()} variants here. Use an offset below ${rep.total.toLocaleString()}.`
+      : `PARTIAL: variants ${(rep.offset + 1).toLocaleString()}-${end.toLocaleString()} of ${rep.total.toLocaleString()} (gnomAD returns them all with no limit of its own, so they are paged here). ` +
+        (next !== null ? `Next page: offset=${next}. ` : '') +
+        `Raise limit (max ${VARIANTS_MAX_LIMIT.toLocaleString()}) for more per call, ${narrowHint}, or use variant for one variant's full detail.`;
+  return {
+    truncated,
+    variants_page: {
+      total: rep.total,
+      returned: rep.kept,
+      offset: rep.offset,
+      limit: win.limit,
+      next_offset: next,
+      upstream_bytes: upstreamBytes,
+      note,
+    },
+  };
+}
+
 const tools: McpToolExport['tools'] = [
   {
     name: 'variant',
@@ -748,12 +1437,13 @@ const tools: McpToolExport['tools'] = [
   },
   {
     name: 'gene',
-    description: 'Gene info + variants. Accepts gene symbol (e.g. "BRCA1") or Ensembl gene id.',
+    description: 'Gene info + its variants. Accepts gene symbol (e.g. "BRCA1") or Ensembl gene id. Variants are paged (default 500, max 2,000 per call); variants_page gives the exact total and next_offset.',
     inputSchema: {
       type: 'object',
       properties: {
         gene_symbol_or_id: { type: 'string' },
         dataset: { type: 'string' },
+        ...PAGE_ARGS,
       },
       required: ['gene_symbol_or_id'],
     },
@@ -761,7 +1451,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'region',
     description:
-      'Variants in a genomic region (≤25kb recommended). You MUST say which genome build your start/stop are in via assembly — there is no default, because a position is valid in both builds and a wrong guess returns real variants from the wrong locus rather than an error.',
+      'Variants in a genomic region (≤25kb recommended). You MUST say which genome build your start/stop are in via assembly — there is no default, because a position is valid in both builds and a wrong guess returns real variants from the wrong locus rather than an error. Variants are paged (default 500, max 2,000 per call); variants_page gives the exact total and next_offset.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -770,18 +1460,20 @@ const tools: McpToolExport['tools'] = [
         stop: { type: 'number' },
         assembly: { type: 'string', description: ASSEMBLY_ARG_DESC },
         dataset: { type: 'string', description: `Default ${DEFAULT_DATASET} (GRCh38). gnomad_r2_1* and exac are GRCh37.` },
+        ...PAGE_ARGS,
       },
       required: ['chrom', 'start', 'stop', 'assembly'],
     },
   },
   {
     name: 'transcript',
-    description: 'Fetch gnomAD variant data for an Ensembl transcript (ENST…), returning transcript coordinates, gene symbol, chromosome position, and per-variant allele counts (ac/an) from exome and genome datasets.',
+    description: 'Fetch gnomAD variant data for an Ensembl transcript (ENST…), returning transcript coordinates, gene symbol, chromosome position, and per-variant allele counts (ac/an) from exome and genome datasets. Variants are paged (default 500, max 2,000 per call); variants_page gives the exact total and next_offset.',
     inputSchema: {
       type: 'object',
       properties: {
         transcript_id: { type: 'string', description: 'Ensembl transcript id (ENST…)' },
         dataset: { type: 'string' },
+        ...PAGE_ARGS,
       },
       required: ['transcript_id'],
     },
@@ -803,8 +1495,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   switch (name) {
     case 'variant':
       return variantDetail(reqStr(args, 'variant_id', '"1-55051215-G-A"'), dataset);
-    case 'gene':
-      return gql(
+    case 'gene': {
+      const win = variantsWindow(args);
+      const r = await gqlPaged(
         `query($q:String!,$ds:DatasetId!,$rg:ReferenceGenomeId!){
           gene_search(query:$q,reference_genome:$rg){ ensembl_id symbol }
           gene(gene_symbol:$q,reference_genome:$rg){
@@ -813,10 +1506,17 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           }
         }`,
         { q: reqStr(args, 'gene_symbol_or_id', '"BRCA1"'), ds: dataset, rg: buildOf(dataset) },
-      ).then((d) => ({ ...(d as Record<string, unknown>), reference_genome: buildOf(dataset), dataset }));
+        win,
+      );
+      return {
+        ...(r.data as Record<string, unknown>), reference_genome: buildOf(dataset), dataset,
+        ...variantsPage(r.page, win, r.bytes, 'narrow to part of the gene with region (chrom/start/stop)'),
+      };
+    }
     case 'region': {
       const build = reqAssembly(args, dataset);
-      const data = (await gql(
+      const win = variantsWindow(args);
+      const r = await gqlPaged(
         `query($chrom:String!,$start:Int!,$stop:Int!,$ds:DatasetId!,$rg:ReferenceGenomeId!){
           region(chrom:$chrom,start:$start,stop:$stop,reference_genome:$rg){
             variants(dataset:$ds){ variant_id rsids consequence exome { ac an } genome { ac an } }
@@ -829,14 +1529,17 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           ds: dataset,
           rg: build,
         },
-      )) as Record<string, unknown>;
+        win,
+      );
+      const data = r.data as Record<string, unknown>;
       // The variant_ids below are chrom-pos-ref-alt in `build`. Handing those
       // back unlabelled is how a coordinate crosses into another tool and
       // becomes a wrong answer somewhere else.
-      return { ...data, reference_genome: build, dataset };
+      return { ...data, reference_genome: build, dataset, ...variantsPage(r.page, win, r.bytes, 'narrow start/stop') };
     }
-    case 'transcript':
-      return gql(
+    case 'transcript': {
+      const win = variantsWindow(args);
+      const r = await gqlPaged(
         `query($id:String!,$ds:DatasetId!,$rg:ReferenceGenomeId!){
           transcript(transcript_id:$id,reference_genome:$rg){
             transcript_id gene_id gene { symbol name } chrom start stop
@@ -844,7 +1547,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           }
         }`,
         { id: reqStr(args, 'transcript_id', '"ENST00000357654"'), ds: dataset, rg: buildOf(dataset) },
-      ).then((d) => ({ ...(d as Record<string, unknown>), reference_genome: buildOf(dataset), dataset }));
+        win,
+      );
+      return {
+        ...(r.data as Record<string, unknown>), reference_genome: buildOf(dataset), dataset,
+        ...variantsPage(r.page, win, r.bytes, 'narrow to part of the transcript with region (chrom/start/stop)'),
+      };
+    }
     case 'search':
       return searchAll(reqStr(args, 'query', '"BRCA"'), dataset);
     default:
@@ -999,10 +1708,33 @@ async function gql(query: string, variables: Record<string, unknown>): Promise<u
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': UA },
     body: JSON.stringify({ query, variables }),
   });
-  if (!res.ok) throw new Error(`gnomAD: ${res.status} ${await res.text().then((t) => t.slice(0, 200))}`);
+  if (!res.ok) throw await httpError(res, 'gnomAD');
   const json = (await res.json()) as { data?: unknown; errors?: { message: string }[] };
   if (json.errors?.length) throw new Error(`gnomAD GraphQL: ${json.errors.map((e) => e.message).join('; ')}`);
   return json.data;
+}
+
+/**
+ * `gql` for the three documents that select `variants`: the same request, with
+ * the body read through readJsonWindowed so only the asked-for page of
+ * variants is ever held. See VARIANTS_DEFAULT_LIMIT for why.
+ */
+async function gqlPaged(
+  query: string,
+  variables: Record<string, unknown>,
+  win: VariantsWindow,
+): Promise<{ data: unknown; page: ArrayWindowReport | undefined; bytes: number }> {
+  const res = await pwFetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': UA },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw await httpError(res, 'gnomAD');
+  const { value, arrays, bytesRead } = await readJsonWindowed<{ data?: unknown; errors?: { message: string }[] }>(
+    res, 'gnomAD', { window: (p) => (VARIANTS_PATH.test(p) ? win : undefined) },
+  );
+  if (value.errors?.length) throw new Error(`gnomAD GraphQL: ${value.errors.map((e) => e.message).join('; ')}`);
+  return { data: value.data, page: arrays.find((a) => VARIANTS_PATH.test(a.path)), bytes: bytesRead };
 }
 
 function reqStr(args: Record<string, unknown>, key: string, example: string): string {

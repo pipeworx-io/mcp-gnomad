@@ -2,15 +2,30 @@
 
 [gnomAD](https://gnomad.broadinstitute.org) MCP — Genome Aggregation Database (Broad Institute) public GraphQL endpoint. Population allele frequencies + variant pathogenicity annotations. Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1879+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `variant(variant_id, dataset?)` — by `chr-pos-ref-alt` (e.g. `1-55051215-G-A`) or rsid
-- `gene(gene_symbol_or_id, dataset?)` — variants in / near a gene
-- `region(chrom, start, stop, dataset?)` — variants in a genomic region
-- `transcript(transcript_id, dataset?)` — variants in / near a transcript
+- `gene(gene_symbol_or_id, dataset?, limit?, offset?)` — variants in / near a gene
+- `region(chrom, start, stop, assembly, dataset?, limit?, offset?)` — variants in a genomic region
+- `transcript(transcript_id, dataset?, limit?, offset?)` — variants in / near a transcript
 - `search(query)` — gene / variant search (autocomplete)
+
+### Variant lists are paged
+
+gnomAD returns every variant for a gene, region or transcript with no limit of
+its own (BRCA1 has about 7,300). `gene`, `region` and `transcript` return one
+page — `limit` (default 500, max 2,000) starting at `offset` (default 0) — and
+say so in the response:
+
+- `truncated`: `true` whenever the page holds fewer variants than gnomAD has;
+- `variants_page`: `total` (exact), `returned`, `offset`, `limit`,
+  `next_offset` (`null` on the last page), `upstream_bytes`, and a plain `note`.
+
+To get more, call again with `offset = next_offset`, raise `limit`, or narrow
+the query with `region`. The page is cut while the response streams in, so a
+large gene costs the gateway one page of memory, not the whole list.
 
 `dataset` defaults to `gnomad_r4` (most recent release). Other valid: `gnomad_r3`, `gnomad_r2_1`, `gnomad_sv_r4`, etc.
 
@@ -62,7 +77,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1879+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
