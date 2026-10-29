@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/gnomad",
   "title": "Gnomad",
   "description": "gnomAD MCP — Broad Institute Genome Aggregation Database (GraphQL).",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/gnomad",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-gnomad",
